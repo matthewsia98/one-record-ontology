@@ -3,10 +3,28 @@ name = "one-record-ontology"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.12.5",
     "rdflib>=7.5.0",
+]
+
+
+[dependency-groups]
+dev = [
+    "devtools>=0.12.2",
+    "fastapi[standard]>=0.128.0",
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+]
+    
+
+[tool.pytest]
+testpaths = [
+    "tests",
+]
+addopts = [
+    "-s",
 ]
 
 
@@ -14,6 +32,12 @@ dependencies = [
 package = true
 
 
+[tool.ruff.lint]
+extend-select = [
+    "I",
+]
+
+
 [tool.ruff.lint.per-file-ignores]
 # Ignore `E741` (ambiguous variable name) in all files under `app/namespaces/code_lists/`.
-"src/one_record_ontology/namespaces/code_lists/*.py" = ["E741"]
+"src/one_record_ontology/models/generated/code_lists.py" = ["E741"]

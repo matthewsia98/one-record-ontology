@@ -1,0 +1,299 @@
+from enum import Enum
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    List,
+    Optional,
+    Self,
+    Set,
+    Union,
+    get_args,
+    get_origin,
+)
+
+from pydantic import AnyUrl, BaseModel, Field, GetJsonSchemaHandler, WithJsonSchema
+from pydantic.fields import ComputedFieldInfo, FieldInfo
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema as cs
+from rdflib import RDF, XSD, BNode, Graph, Literal, URIRef
+
+from one_record_ontology.utils.graph_utils import SubjectType, get_root_subject
+
+
+def field_title_generator(
+    field_name: str, field_info: FieldInfo | ComputedFieldInfo
+) -> str:
+    if isinstance(field_info, FieldInfo) and field_info.serialization_alias:
+        return field_info.serialization_alias
+
+    return field_name
+
+
+class OneRecordBaseModel(BaseModel):
+    _type: ClassVar[URIRef]
+    _types: ClassVar[List[URIRef]]
+    graph: Optional[Graph] = Field(default=None, exclude=True)
+    subject: Annotated[
+        SubjectType, WithJsonSchema({"type": "string", "format": "uri"})
+    ] = Field(
+        default_factory=lambda: BNode().skolemize(basepath="internal:"),
+        serialization_alias="@id",
+    )
+
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "url_preserve_empty_path": True,
+        "validate_assignment": True,
+        "json_schema_mode_override": "serialization",
+        "field_title_generator": field_title_generator,
+    }
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: cs.CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        json_schema = handler(core_schema)
+        json_schema = handler.resolve_ref_schema(json_schema)
+
+        # json_schema["properties"]["@id"] = {
+        #     "type": "string",
+        #     "format": "uri",
+        #     # "description": "JSON-LD @id value",
+        # }
+        json_schema["properties"]["@type"] = {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "format": "uri",
+                # "enum": [str(t) for t in cls._types],
+            },
+            # "description": "JSON-LD rdf:type values",
+        }
+
+        return json_schema
+
+    # @computed_field(alias="@id")
+    # def id(self) -> AnyUrl:
+    #     if isinstance(self.subject, BNode):
+    #         return AnyUrl(url=str(self.subject.skolemize()))
+
+    #     return AnyUrl(url=str(self.subject))
+
+    # @computed_field(alias="@type")
+    # def types(self) -> List[AnyUrl]:
+    #     return [AnyUrl(url=str(t)) for t in self.__class__._types]
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        if cls is OneRecordBaseModel:
+            return  # base class itself is allowed
+
+        if not hasattr(cls, "_type") or not cls._type:
+            raise TypeError(
+                f"{cls.__name__} must define a non-empty class attribute `_type`"
+            )
+
+        if not hasattr(cls, "_types") or not cls._types:
+            raise TypeError(
+                f"{cls.__name__} must define a non-empty class attribute `_types`"
+            )
+
+    @classmethod
+    def from_graph(
+        cls,
+        g: Graph,
+        subject: Optional[SubjectType] = None,
+        subjects_processed: Optional[dict[SubjectType, Self]] = None,
+    ) -> Self:
+        if subjects_processed is None:
+            subjects_processed = {}
+
+        if subject is None:
+            subject = get_root_subject(g, cls._type)
+
+        if subject in subjects_processed:
+            return subjects_processed[subject]
+
+        result = cls()
+        result.graph = g
+        result.subject = subject
+        subjects_processed[subject] = result
+
+        kwargs: dict[str, Any] = {}
+
+        for name, field in cls.model_fields.items():
+            if field.annotation is None:
+                raise TypeError(f"Field {name} has no annotation")
+
+            if field.serialization_alias is None:
+                continue
+
+            annotation = field.annotation
+            origin = get_origin(annotation)
+            if origin is list or origin is Union:
+                (base_type, *_) = get_args(annotation)
+            else:
+                base_type = annotation
+
+            field_uri = URIRef(field.serialization_alias)
+
+            if issubclass(base_type, OneRecordBaseModel):
+                if origin is not list:
+                    obj_node = g.value(subject, field_uri)
+                    if obj_node is not None:
+                        types = g.objects(obj_node, RDF.type)
+
+                        all_subclasses = []
+                        for sub in base_type.__subclasses__():
+                            all_subclasses.append(sub)
+                            all_subclasses.extend(sub.__subclasses__())
+                        all_subclasses.sort(
+                            key=lambda cls: len(cls.mro()), reverse=True
+                        )
+
+                        for t in types:
+                            for subclass in all_subclasses:
+                                if t == subclass._type:
+                                    base_type = subclass
+                                    break
+                        obj = base_type.from_graph(g, obj_node, subjects_processed)
+                        kwargs[name] = obj
+                else:
+                    objs = []
+                    for obj_node in g.objects(subject, field_uri):
+                        types = g.objects(obj_node, RDF.type)
+
+                        all_subclasses = []
+                        for sub in base_type.__subclasses__():
+                            all_subclasses.append(sub)
+                            all_subclasses.extend(sub.__subclasses__())
+                        all_subclasses.sort(
+                            key=lambda cls: len(cls.mro()), reverse=True
+                        )
+
+                        for t in types:
+                            for subclass in all_subclasses:
+                                if t == subclass._type:
+                                    base_type = subclass
+                                    break
+                        obj = base_type.from_graph(g, obj_node, subjects_processed)
+                        objs.append(obj)
+                    kwargs[name] = objs
+            else:
+                if origin is not list:
+                    value = g.value(subject, field_uri)
+                    if isinstance(value, URIRef):
+                        kwargs[name] = base_type(str(value))
+                    elif isinstance(value, Literal):
+                        # if value.datatype == XSD.anyURI and issubclass(
+                        #     base_type, AnyUrl
+                        # ):
+                        #     kwargs[name] = base_type(str(value))
+                        # else:
+                        kwargs[name] = value.toPython()
+                else:
+                    values: list[Any] = []
+                    for obj in g.objects(subject, field_uri):
+                        if isinstance(obj, URIRef):
+                            values.append(base_type(str(obj)))
+                        elif isinstance(obj, Literal):
+                            # if obj.datatype == XSD.anyURI and issubclass(
+                            #     base_type, AnyUrl
+                            # ):
+                            #     values.append(base_type(str(obj)))
+                            # else:
+                            values.append(obj.toPython())
+                    kwargs[name] = values
+
+        for key, value in kwargs.items():
+            setattr(result, key, value)
+
+        return result
+
+    def to_graph(self, subjects_processed: Optional[Set[SubjectType]] = None) -> Graph:
+        if subjects_processed is None:
+            subjects_processed = set()
+
+        if self.subject in subjects_processed:
+            return Graph()
+
+        subjects_processed.add(self.subject)
+
+        g = Graph()
+
+        if self.graph is not None:
+            original_types = self.graph.objects(self.subject, RDF.type)
+            for t in original_types:
+                g.add((self.subject, RDF.type, t))
+
+        for t in self.__class__._types:
+            g.add((self.subject, RDF.type, t))
+
+        for name, field in self.__class__.model_fields.items():
+            if (
+                field.annotation is None
+                or field.serialization_alias == "@id"
+                or field.serialization_alias is None
+            ):
+                continue
+
+            annotation = field.annotation
+            origin = get_origin(annotation)
+            if origin is list or origin is Union:
+                (base_type, *_) = get_args(annotation)
+            else:
+                base_type = annotation
+
+            value = getattr(self, name)
+
+            if value is None:
+                continue
+
+            if issubclass(base_type, OneRecordBaseModel):
+                objs: List[OneRecordBaseModel]
+                if origin is not list:
+                    objs = [value]
+                else:
+                    objs = value
+
+                for obj in objs:
+                    obj_graph = obj.to_graph(subjects_processed)
+                    g += obj_graph
+                    g.add(
+                        (
+                            self.subject,
+                            URIRef(field.serialization_alias),
+                            obj.subject,
+                        )
+                    )
+            else:
+                if origin is not list:
+                    objs = [value]
+                else:
+                    objs = value
+
+                for value in objs:
+                    if isinstance(value, Enum):
+                        g.add(
+                            (
+                                self.subject,
+                                URIRef(field.serialization_alias),
+                                URIRef(value.value),
+                            )
+                        )
+                    else:
+                        datatype = None
+                        if isinstance(value, AnyUrl):
+                            datatype = XSD.anyURI
+
+                        g.add(
+                            (
+                                self.subject,
+                                URIRef(field.serialization_alias),
+                                Literal(value, datatype=datatype),
+                            )
+                        )
+
+        return g
